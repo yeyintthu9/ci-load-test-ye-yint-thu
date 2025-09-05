@@ -1,0 +1,162 @@
+# ---------------------------------------------------------
+# GitHub Actions CI/CD Workflow for Pull Requests
+#
+# Runs on PRs to the main branch when relevant code changes.
+# Provisions a KinD multi-node Kubernetes cluster, deploys
+# http-echo workloads with ingress, runs load tests, collects
+# metrics, posts results as PR comment, and installs monitoring.
+# ---------------------------------------------------------
+
+name: LOAD TEST CI ON PR
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'app/**'
+      - 'k8s/**'
+      - 'scripts/**'
+      - 'loadtest/**'
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  
+jobs:
+  ci-load-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout repository
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      # 2. Set up kubectl
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      # 3. Set up helm
+      - name: Set up helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'latest'
+
+      # 4. Set up kind
+      - name: Set up kind
+        uses: helm/kind-action@v1.10.0
+
+      # 5. Install extra tools (k6, Go, jq, curl)
+      - name: Install extra tools
+        run: |
+          curl -s https://dl.k6.io/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/k6-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update
+          sudo apt-get install -y k6 golang-go jq curl
+        shell: bash
+
+      # 6. Build http-echo app
+      - name: Build http-echo app
+        run: |
+          make -C app/http-echo OS=linux ARCH=amd64 bin
+        shell: bash
+
+      # 7. Create multi-node KinD cluster
+      - name: Create KinD cluster
+        run: kind create cluster --config k8s/kind-config.yaml
+        shell: bash
+
+      # 8. Install ingress-nginx
+      - name: Install ingress-nginx
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+          kubectl wait --namespace ingress-nginx \
+            --for=condition=Ready pods \
+            --selector=app.kubernetes.io/component=controller \
+            --timeout=180s
+        shell: bash
+
+      # 9. Build & load Docker image into KinD
+      - name: Build and load Docker image into KinD
+        run: |
+          IMAGE_TAG=pr-${{ github.event.pull_request.number }}
+          PRODUCT_VERSION=$(cat app/http-echo/version/VERSION || echo "0.0.0-dev")
+          docker build --platform linux/amd64 \
+            --build-arg BIN_NAME=http-echo \
+            --build-arg PRODUCT_VERSION=${PRODUCT_VERSION} \
+            -t http-echo:${IMAGE_TAG} app/http-echo
+          kind load docker-image http-echo:${IMAGE_TAG} --name kind
+        shell: bash
+
+      # 10. Deploy apps + ingress
+      - name: Deploy app and ingress
+        env:
+          IMAGE_TAG: pr-${{ github.event.pull_request.number }}
+        run: |
+          sed "s|IMAGE_PLACEHOLDER|http-echo:${IMAGE_TAG}|g" k8s/deployments.yaml | kubectl apply -f -
+          kubectl apply -f k8s/services.yaml
+          kubectl apply -f k8s/ingress.yaml
+          kubectl rollout status deploy/foo --timeout=60s
+          kubectl rollout status deploy/bar --timeout=60s
+          bash scripts/wait-for-ingress.sh foo.localhost 180
+          bash scripts/wait-for-ingress.sh bar.localhost 180
+        shell: bash
+      
+      # 11. Add to hosts 
+      - name: Add foo.localhost and bar.localhost to hosts
+        run: |
+          echo "127.0.0.1 foo.localhost bar.localhost" | sudo tee -a /etc/hosts
+        shell: bash
+
+      # 12. Run load tests
+      - name: Run load tests and save results
+        run: |
+          mkdir -p loadtest/results
+          k6 run --vus 50 --duration 30s \
+            --summary-export=loadtest/results/loadtest.json \
+            loadtest/k6-script.js
+        shell: bash
+      
+      # 13. Process load test results
+      - name: Process load test results
+        id: results
+        run: |
+          round() { printf "%.2f" "$1"; }
+
+          AVG=$(jq -r '.metrics.http_req_duration.avg // 0' loadtest/results/loadtest.json)
+          P90=$(jq -r '.metrics.http_req_duration["p(90)"] // 0' loadtest/results/loadtest.json)
+          P95=$(jq -r '.metrics.http_req_duration["p(95)"] // 0' loadtest/results/loadtest.json)
+          FAIL_PERCENT=$(jq -r '.metrics.http_req_failed.value // 0' loadtest/results/loadtest.json)
+          REQS_PER_SEC=$(jq -r '.metrics.http_reqs.rate // 0' loadtest/results/loadtest.json)
+
+          {
+            echo "avg=$(round $AVG)"
+            echo "p90=$(round $P90)"
+            echo "p95=$(round $P95)"
+            echo "fail_percent=$(round $FAIL_PERCENT)"
+            echo "req_per_sec=$(round $REQS_PER_SEC)"
+          } >> "$GITHUB_OUTPUT"
+      
+        # 14. Post results as PR comment
+      - name: Post results as PR comment
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body: |
+            ### Load Test Results
+            - Avg Request Duration: ${{ steps.results.outputs.avg }} ms
+            - P90 Request Duration: ${{ steps.results.outputs.p90 }} ms
+            - P95 Request Duration: ${{ steps.results.outputs.p95 }} ms
+            - % Failed Requests: ${{ steps.results.outputs.fail_percent }}
+            - Requests/sec: ${{ steps.results.outputs.req_per_sec }}
+
+      # 15. Cleanup cluster
+      - name: Cleanup
+        if: always()
+        run: kind delete cluster
+        shell: bash

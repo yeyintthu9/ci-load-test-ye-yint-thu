@@ -1,0 +1,20 @@
+# Defines a multi-node cluster with 1 control plane and 2 worker nodes.
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+
+nodes:
+  # Control plane node (manages the cluster state, API server, etc.)
+  - role: control-plane
+    extraPortMappings:
+      # Map host ports 80/443 to the control-plane node so Ingress is reachable at localhost
+      - containerPort: 80
+        hostPort: 80
+        protocol: TCP
+      - containerPort: 443
+        hostPort: 443
+        protocol: TCP
+
+  # Worker nodes (where workloads like Deployments, Pods, and Services run)
+  - role: worker
+  - role: worker

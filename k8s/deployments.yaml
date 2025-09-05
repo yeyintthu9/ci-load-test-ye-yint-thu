@@ -1,0 +1,48 @@
+# Deployment for "foo" service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: foo
+spec:
+  replicas: 2  # Number of pods
+  selector:
+    matchLabels:
+      app: foo
+  template:
+    metadata:
+      labels:
+        app: foo
+    spec:
+      containers:
+      - name: foo
+        # The image will be replaced dynamically in CI with:
+        # http-echo:pr-<PR_NUMBER>
+        image: IMAGE_PLACEHOLDER
+        args:
+          - "-text=foo"  # Response text for http-echo
+        ports:
+        - containerPort: 5678
+
+---
+# Deployment for "bar" service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bar
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: bar
+  template:
+    metadata:
+      labels:
+        app: bar
+    spec:
+      containers:
+      - name: bar
+        image: IMAGE_PLACEHOLDER  # Will be replaced with PR-specific image
+        args:
+          - "-text=bar"
+        ports:
+        - containerPort: 5678
